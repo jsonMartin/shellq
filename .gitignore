@@ -1,0 +1,12 @@
+target/
+node_modules/
+*.log
+.DS_Store
+.firecrawl/
+# Local credential-prone files; example templates stay tracked.
+.env
+.env.*
+!.env.example
+*.pem
+credentials*.json
+auth.json

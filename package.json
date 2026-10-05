@@ -1,0 +1,29 @@
+{
+  "name": "shellq",
+  "version": "1.0.0-beta.1",
+  "description": "AI help for zsh at your prompt: commands, fixes and answers, reviewed before anything runs",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jsonMartin/shellq.git"
+  },
+  "scripts": {
+    "test": "bun test test/workbench.test.ts test/workbench-ui.test.ts test/codex-app-server-provider.test.ts test/codex-app-server-session.test.ts test/claude-stream-provider.test.ts test/local-openai-provider.test.ts test/local-endpoint-discovery.test.ts",
+    "test:shell": "zsh test/test.zsh",
+    "test:provider": "zsh test/codex-provider-persistence.test.zsh",
+    "test:pty": "zsh test/workbench-pty-smoke.zsh",
+    "test:fixture": "zsh test/ask-fixture-smoke.zsh"
+  },
+  "dependencies": {
+    "@opentui/core": "0.4.5",
+    "@opentui/react": "0.4.5",
+    "cli-spinners": "3.4.0",
+    "react": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.3",
+    "@types/react": "19.2.8",
+    "typescript": "5.9.3"
+  }
+}

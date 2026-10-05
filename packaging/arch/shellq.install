@@ -1,0 +1,5 @@
+post_install() {
+  echo "To load ShellQ, add this line to the end of ~/.zshrc:"
+  echo "  source /usr/share/shellq/shellq.plugin.zsh"
+  echo "Then open a new shell and press Ctrl+O."
+}

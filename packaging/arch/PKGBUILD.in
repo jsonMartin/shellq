@@ -1,0 +1,30 @@
+# Maintainer: jsonMartin <4033621+jsonMartin@users.noreply.github.com>
+# Template: scripts/release.sh fills in @TAG@, @PKGVER@ and @SHA256@.
+pkgname=shellq
+_tag=@TAG@
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc="AI help for zsh at your prompt: commands, fixes and answers"
+# node_modules carries OpenTUI's prebuilt native library for the build machine.
+arch=('x86_64' 'aarch64')
+url="https://github.com/jsonMartin/shellq"
+license=('MIT')
+depends=('bun' 'jq' 'zsh')
+options=('!strip' '!debug')
+install=shellq.install
+source=("$pkgname-$_tag.tar.gz::$url/archive/refs/tags/$_tag.tar.gz")
+sha256sums=('@SHA256@')
+
+build() {
+  cd "$pkgname-${_tag#v}"
+  BUN_INSTALL_CACHE_DIR="$srcdir/bun-cache" bun install --frozen-lockfile --production
+}
+
+package() {
+  cd "$pkgname-${_tag#v}"
+  install -d "$pkgdir/usr/share/$pkgname"
+  # tsconfig.json carries the @/ import alias and JSX settings Bun needs at runtime.
+  cp -r --no-preserve=ownership shellq.plugin.zsh src package.json bun.lock tsconfig.json node_modules \
+    "$pkgdir/usr/share/$pkgname/"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
