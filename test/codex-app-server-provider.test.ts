@@ -1,4 +1,4 @@
-import { prepareAppServerLaunch } from "../src/codex-app-server-isolation"
+import { prepareAppServerLaunch, validateConfigRead } from "../src/codex-app-server-isolation"
 import { describe, expect, test } from "bun:test"
 import {
   chmodSync,
@@ -9,6 +9,7 @@ import {
   readlinkSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
@@ -844,6 +845,24 @@ describe("Codex App Server adapter", () => {
   }, 10_000)
 })
 
+
+test("a state directory behind a symlink resolves to the paths Codex reports", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "shellq-isolation-")))
+  try {
+    const native = join(root, "native")
+    mkdirSync(native)
+    writeFileSync(join(native, "auth.json"), "synthetic login", { mode: 0o600 })
+    mkdirSync(join(root, "real"))
+    symlinkSync(join(root, "real"), join(root, "link"))
+    const launch = prepareAppServerLaunch({ HOME: root, PATH: "/fixture/bin", CODEX_HOME: native, SHELLQ_STATE_DIR: join(root, "link", "state") })
+    const resolved = join(root, "real", "state", "codex-home")
+    expect(launch.home).toBe(resolved)
+    expect(launch.config).toBe(join(resolved, "config.toml"))
+    expect(launch.ephemeralCwd).toBe(join(resolved, "empty"))
+    const receipt = { layers: [{ name: { type: "user", file: launch.config, profile: null } }], config: {} }
+    expect(() => validateConfigRead(receipt, root, launch.config)).not.toThrow()
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
 
 test("private native home references fake file login and preserves native histories", () => {
   const root = mkdtempSync(join(tmpdir(), "shellq-isolation-"))

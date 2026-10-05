@@ -160,7 +160,11 @@ export function prepareAppServerLaunch(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): AppServerLaunch {
   const source = sourceAuthPath(env)
-  const home = join(resolveStateRoot(env), "codex-home")
+  const declaredHome = join(resolveStateRoot(env), "codex-home")
+  privateDirectory(declaredHome)
+  // Codex reports resolved paths, so a state root behind a symlink (macOS
+  // /var -> /private/var, stow-managed ~/.local) must use them too.
+  const home = realpathSync(declaredHome)
   const config = ensurePrivateConfig(home)
   ensureAuthLink(home, source)
   const ephemeralCwd = join(home, "empty")
