@@ -219,6 +219,21 @@ default_provider=$(zsh -fc \
 _expect_eq 'bundled provider defaults to the shared executable adapter' \
   "${TEST_DIR:h}/src/codex-provider.zsh" "$default_provider"
 
+typeset second_copy=${$(mktemp -d):A} reloaded
+cp "$TEST_PLUGIN" "$second_copy/shellq.plugin.zsh"
+ln -s "${TEST_DIR:h}/src" "$second_copy/src"
+reloaded=$(zsh -fc \
+  'source "$1"; source "$2/shellq.plugin.zsh"; print -r -- "$SHELLQ_PROVIDER[1] $SHELLQ_WORKBENCH_COMMAND[2]"' \
+  _ "$TEST_PLUGIN" "$second_copy")
+_expect_eq 'a ShellQ copy loaded later uses its own provider and workbench' \
+  "$second_copy/src/codex-provider.zsh $second_copy/src/workbench.ts" "$reloaded"
+reloaded=$(zsh -fc \
+  'SHELLQ_WORKBENCH_COMMAND=(my-workbench); source "$1"; source "$2/shellq.plugin.zsh"; print -r -- "$SHELLQ_WORKBENCH_COMMAND"' \
+  _ "$TEST_PLUGIN" "$second_copy")
+_expect_eq 'a user workbench command survives loading two ShellQ copies' \
+  my-workbench "$reloaded"
+rm -rf "$second_copy"
+
 _expect_eq 'duration rounds just below one minute' \
   59.9s "$(_shellq_format_duration 59.94)"
 _expect_eq 'duration rounds at one minute' \

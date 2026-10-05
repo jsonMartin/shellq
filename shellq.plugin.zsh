@@ -7,6 +7,13 @@ typeset -g _SHELLQ_PLUGIN_DIR=${${(%):-%x}:A:h}
 typeset -g _SHELLQ_SRC_DIR=$_SHELLQ_PLUGIN_DIR/src
 typeset -g _SHELLQ_DEFAULT_PROVIDER=$_SHELLQ_SRC_DIR/codex-provider.zsh
 
+# Path defaults left by another ShellQ copy loaded earlier are not user
+# choices; drop them so the copy loaded last owns its own files.
+[[ -n ${_SHELLQ_SET_PROVIDER+set} && ${(j: :)${(q)SHELLQ_PROVIDER[@]}} == "$_SHELLQ_SET_PROVIDER" ]] &&
+  unset SHELLQ_PROVIDER
+[[ -n ${_SHELLQ_SET_WORKBENCH+set} && ${(j: :)${(q)SHELLQ_WORKBENCH_COMMAND[@]}} == "$_SHELLQ_SET_WORKBENCH" ]] &&
+  unset SHELLQ_WORKBENCH_COMMAND
+
 if (( ! ${+parameters[SHELLQ_PROVIDER]} )); then
   if (( $+commands[jq] )) &&
      [[ -x $_SHELLQ_DEFAULT_PROVIDER ]]; then
@@ -14,6 +21,7 @@ if (( ! ${+parameters[SHELLQ_PROVIDER]} )); then
   else
     typeset -ga SHELLQ_PROVIDER=()
   fi
+  typeset -g _SHELLQ_SET_PROVIDER=${(j: :)${(q)SHELLQ_PROVIDER[@]}}
 else
   typeset -ga SHELLQ_PROVIDER
 fi
@@ -53,6 +61,7 @@ if (( ! ${+parameters[SHELLQ_WORKBENCH_COMMAND]} )); then
     bun
     "$_SHELLQ_SRC_DIR/workbench.ts"
   )
+  typeset -g _SHELLQ_SET_WORKBENCH=${(j: :)${(q)SHELLQ_WORKBENCH_COMMAND[@]}}
 else
   typeset -ga SHELLQ_WORKBENCH_COMMAND
 fi
