@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
-import type { Socket } from "node:net"
+import { type IncomingMessage, type Server, type ServerResponse } from "node:http"
 import { join } from "node:path"
 
 import { AdapterFailure, peerIsTrusted, validateEndpoint } from "../src/local-openai-provider"
+import { startRawTcpFixture } from "./raw-tcp-fixture"
 import {
   readAskStream,
   buildAskRequest,
@@ -27,42 +27,19 @@ type Fixture = {
 const openFixtures: Fixture[] = []
 
 function startFixture(handler: (req: IncomingMessage, res: ServerResponse) => void): Promise<Fixture> {
-  return new Promise((resolve) => {
-    const hits: { path: string; method: string }[] = []
-    const sockets = new Set<Socket>()
-    let closed = false
-    const server = createServer((req, res) => {
-      hits.push({ path: req.url ?? "", method: req.method ?? "" })
-      handler(req, res)
-    })
-    server.on("connection", (socket) => {
-      sockets.add(socket)
-      socket.on("close", () => sockets.delete(socket))
-    })
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address()
-      if (!address || typeof address === "string") throw new Error("no port")
-      const port = address.port
-      const fixture: Fixture = {
-        port,
-        endpoint: `http://127.0.0.1:${port}/v1`,
-        hits,
-        close: () =>
-          new Promise<void>((r) => {
-            if (closed) return r()
-            closed = true
-            // Server.close() only stops new connections and waits out
-            // in-flight ones gracefully; several fixtures deliberately hold
-            // a request open forever, so force every live socket shut too
-            // (Bun's node:http polyfill does not implement
-            // closeAllConnections, so this is done by hand).
-            server.close(() => r())
-            for (const socket of sockets) socket.destroy()
-          }),
-      }
-      openFixtures.push(fixture)
-      resolve(fixture)
-    })
+  const hits: { path: string; method: string }[] = []
+  return startRawTcpFixture((req, res) => {
+    hits.push({ path: req.url ?? "", method: req.method ?? "" })
+    handler(req, res)
+  }).then((raw) => {
+    const fixture: Fixture = {
+      port: raw.port,
+      endpoint: `http://127.0.0.1:${raw.port}/v1`,
+      hits,
+      close: raw.close,
+    }
+    openFixtures.push(fixture)
+    return fixture
   })
 }
 

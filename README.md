@@ -264,8 +264,11 @@ downloads servers or models.
 <summary><b>The panel</b> · size, borders and footer</summary>
 
 - The panel starts at three rows under your prompt and grows to 8 for results
-  and Settings, 12 for Details, and up to 16 for long answers. It never shrinks
-  while open and always leaves one row for your prompt.
+  and Settings, 12 for Details, and up to your configured maximum for long
+  answers — 12 rows by default, at most 16. Change it under `More settings &
+  actions` → `Max height`; the new bound applies the next time you open the
+  panel. It never shrinks while open and always leaves one row for your
+  prompt.
 - The top border shows the mode (`[Ask] · Command · Fix`) and provider, model
   and effort. The bottom border shows your directory, status, attached-output
   size and `^X actions`.

@@ -31,7 +31,9 @@ import {
   COMPACT_FOOTER_HEIGHT,
   CONTEXT_PREVIEW_LABEL,
   CONTEXT_PREVIEW_MAX_ROWS,
+  DEFAULT_FOOTER_MAX_ROWS,
   DETAILS_FOOTER_HEIGHT,
+  FOOTER_MAX_ROWS_OPTIONS,
   INFERENCE_SETTINGS_MAX_BYTES,
   INFERENCE_SETTINGS_LOCK,
   LOCAL_DISCOVERY_MAX_BYTES,
@@ -84,6 +86,7 @@ import {
   writePersistedLocalEndpoint,
   writePersistedLocalThinking,
   writePersistedMetricsExpanded,
+  writePersistedMaxFooterRows,
   writePersistedInitialChoices,
   LOCAL_PROVIDER_ID,
   parseLocalCatalog,
@@ -248,9 +251,10 @@ describe("workbench trust boundaries", () => {
       providerSource: "default",
       reasoning: "low",
     })
-    // 8 provider/model/effort/engine destinations plus the 5 global Initial
-    // choices rows (spec: five root parents; global initial choice count).
-    expect(sources.filter((source) => source.kind === "set")).toHaveLength(13)
+    // 8 provider/model/effort/engine destinations, the 5 global Initial
+    // choices rows, and the 3 global Max height rows (spec: five root
+    // parents; global initial choice count; global maximum frame height).
+    expect(sources.filter((source) => source.kind === "set")).toHaveLength(16)
     expect(sources.filter((source) => source.authorityKey === "initial-choices"))
       .toHaveLength(5)
     expect(sources.filter((source) => source.field === "reasoning").map((source) => source.label))
@@ -398,10 +402,12 @@ describe("workbench trust boundaries", () => {
       "Provider Setup",
       "Configure local endpoint",
     ])
-    // Provider-authority sets stay configured-only and opaque; the 5 global
-    // Initial choices rows carry no provider destination (global setting).
+    // Provider-authority sets stay configured-only and opaque; the global
+    // Initial choices and Max height rows carry no provider destination
+    // (global settings).
     const configuredSets = sources.filter(
-      (source) => source.kind === "set" && source.authorityKey !== "initial-choices",
+      (source) => source.kind === "set" && source.authorityKey !== "initial-choices" &&
+        source.authorityKey !== "max-footer-rows",
     )
     expect(configuredSets).toHaveLength(4)
     expect(configuredSets.every((source) => source.destination?.authority.kind === "configured")).toBe(true)
@@ -4852,6 +4858,64 @@ describe("streamed local Ask pure layer (spike)", () => {
       requestedFooterHeight({ ...base, intent: "generate", phase: "loading" }),
     ).toBe(COMPACT_FOOTER_HEIGHT)
   })
+
+  test("a configured maximum bounds every surface while omitted maxRows changes nothing", () => {
+    expect([...FOOTER_MAX_ROWS_OPTIONS]).toEqual([8, 12, 16])
+    expect(DEFAULT_FOOTER_MAX_ROWS).toBe(12)
+    const base = {
+      actionsOpen: false,
+      composerLines: 1,
+      editorMode: "composer" as const,
+      intent: "ask" as const,
+      previewVisible: false,
+      settingsOpen: false,
+      terminalRows: 40,
+      view: "main" as const,
+    }
+    for (const maxRows of FOOTER_MAX_ROWS_OPTIONS) {
+      // Ask streaming and the completed answer stop at the cap.
+      expect(steppedAskFooterHeight(400, 40, maxRows)).toBe(maxRows)
+      expect(
+        requestedFooterHeight({ ...base, phase: "streaming", askContentLines: 400, maxRows }),
+      ).toBe(maxRows)
+      expect(
+        requestedFooterHeight({ ...base, phase: "answer", askContentLines: 400, maxRows }),
+      ).toBe(maxRows)
+      // Candidate content is pinned by the eight-row promotion floor; at cap
+      // eight that floor and the cap coincide.
+      expect(
+        requestedFooterHeight({
+          ...base, intent: "generate" as const, phase: "candidate",
+          candidateContentLines: 400, maxRows,
+        }),
+      ).toBe(Math.max(READER_FOOTER_HEIGHT, maxRows))
+      // Details and Doctor take the smallest fitting of twelve and the cap.
+      expect(requestedFooterHeight({ ...base, phase: "loading", view: "details", maxRows })).toBe(
+        Math.min(DETAILS_FOOTER_HEIGHT, maxRows),
+      )
+      expect(requestedFooterHeight({ ...base, phase: "loading", view: "doctor", maxRows })).toBe(
+        Math.min(DETAILS_FOOTER_HEIGHT, maxRows),
+      )
+      // Fixed eight-row surfaces stay untouched; they are the floor at the
+      // minimum offered cap.
+      expect(requestedFooterHeight({ ...base, phase: "loading", settingsOpen: true, maxRows })).toBe(READER_FOOTER_HEIGHT)
+      expect(requestedFooterHeight({ ...base, phase: "loading", actionsOpen: true, maxRows })).toBe(READER_FOOTER_HEIGHT)
+      expect(requestedFooterHeight({ ...base, phase: "loading", editorMode: "prompt", maxRows })).toBe(READER_FOOTER_HEIGHT)
+      // The wrapping compact composer is bounded by the same cap.
+      expect(
+        requestedFooterHeight({
+          ...base, intent: "generate" as const, phase: "loading", composerLines: 400, maxRows,
+        }),
+      ).toBe(Math.min(maxRows, READER_FOOTER_HEIGHT, COMPACT_FOOTER_HEIGHT + 399))
+    }
+    // The physical terminal still wins over any cap.
+    expect(steppedAskFooterHeight(400, 10, 16)).toBe(9)
+    expect(
+      requestedFooterHeight({ ...base, phase: "answer", askContentLines: 400, terminalRows: 10, maxRows: 16 }),
+    ).toBe(9)
+    // Smaller caps keep Ask's four-row starting frame usable.
+    expect(steppedAskFooterHeight(1, 40, 8)).toBe(4)
+  })
 })
 
 
@@ -4995,6 +5059,33 @@ describe("batch candidates", () => {
     writeFileSync(inferenceSettingsFile(env),JSON.stringify(settings))
     expect(readPersistedInferenceDocument(env)).toBeNull()
     expect(()=>writePersistedInitialChoices(3,env)).toThrow("settings need repair")
+  } finally {rmSync(root,{recursive:true,force:true})}
+})
+test("the maximum footer rows persists globally and preserves unrelated settings", () => {
+  const root=mkdtempSync(join(tmpdir(),"shellq-footer-max-"));const env={SHELLQ_STATE_DIR:root}
+  try {
+    writePersistedMetricsExpanded(false,env)
+    writePersistedInitialChoices(3,env)
+    writePersistedInferenceSettings("gpt-5.6-luna","low",env,"codex")
+    writePersistedLocalThinking("http://127.0.0.1:8080/v1","qwen",true,env)
+    for(const rows of FOOTER_MAX_ROWS_OPTIONS) {
+      writePersistedMaxFooterRows(rows,env)
+      const document=readPersistedInferenceDocument(env)
+      expect(document?.maxFooterRows).toBe(rows)
+      expect(document?.metricsExpanded).toBe(false)
+      expect(document?.initialChoices).toBe(3)
+      expect(document?.providers.codex).toEqual({model:"gpt-5.6-luna",reasoning:"low"})
+      expect(document?.localThinking).toHaveLength(1)
+    }
+    expect(()=>writePersistedMaxFooterRows(6 as 16,env)).toThrow("invalid footer maximum")
+    const settings=JSON.parse(readFileSync(inferenceSettingsFile(env),"utf8"));settings.maxFooterRows="12"
+    writeFileSync(inferenceSettingsFile(env),JSON.stringify(settings))
+    expect(readPersistedInferenceDocument(env)).toBeNull()
+    expect(()=>writePersistedMaxFooterRows(12,env)).toThrow("settings need repair")
+    // A pre-existing document without the key reads back absent; the caller
+    // applies its default.
+    writeFileSync(inferenceSettingsFile(env),JSON.stringify({version:2,provider:"codex",providers:{codex:{model:"m",reasoning:"low"}}}))
+    expect(readPersistedInferenceDocument(env)?.maxFooterRows).toBeUndefined()
   } finally {rmSync(root,{recursive:true,force:true})}
 })
 test("Command and Fix previews stop growing at twelve while results can grow to sixteen", () => {

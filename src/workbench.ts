@@ -1259,6 +1259,7 @@ export type PersistedInferenceDocument = {
   localThinking?: LocalThinkingPreference[]
   initialChoices?: 1 | 2 | 3 | 4 | 5
   metricsExpanded?: boolean
+  maxFooterRows?: 8 | 12 | 16
 }
 
 const validSelection = (value: unknown): value is PersistedInferenceSettings =>
@@ -1295,7 +1296,7 @@ function parseInferenceDocument(value: unknown): PersistedInferenceDocument | nu
     !record.providers ||
     typeof record.providers !== "object" ||
     Array.isArray(record.providers) ||
-    Object.keys(record).some(key => !["version", "provider", "providers", "localEndpoint", "localThinking", "metricsExpanded", "initialChoices"].includes(key))
+    Object.keys(record).some(key => !["version", "provider", "providers", "localEndpoint", "localThinking", "metricsExpanded", "initialChoices", "maxFooterRows"].includes(key))
   ) return null
   const providers: Record<string, PersistedInferenceSettings> = {}
   for (const [id, selection] of Object.entries(record.providers)) {
@@ -1307,6 +1308,7 @@ function parseInferenceDocument(value: unknown): PersistedInferenceDocument | nu
   if ("localEndpoint" in record && !endpoint) return null
   if ("metricsExpanded" in record && typeof record.metricsExpanded !== "boolean") return null
   if ("initialChoices" in record && ![1, 2, 3, 4, 5].includes(record.initialChoices as number)) return null
+  if ("maxFooterRows" in record && ![8, 12, 16].includes(record.maxFooterRows as number)) return null
   const localThinking = record.localThinking
   if ("localThinking" in record && (!Array.isArray(localThinking) || localThinking.some(entry =>
     !entry || typeof entry !== "object" || Array.isArray(entry) ||
@@ -1317,7 +1319,8 @@ function parseInferenceDocument(value: unknown): PersistedInferenceDocument | nu
   return { version: 2, provider: record.provider, providers, ...(endpoint ? { localEndpoint: endpoint.raw } : {}),
     ...(Array.isArray(localThinking) ? { localThinking } : {}),
     ...(typeof record.metricsExpanded === "boolean" ? {metricsExpanded:record.metricsExpanded} : {}),
-    ...("initialChoices" in record ? {initialChoices: record.initialChoices as 1 | 2 | 3 | 4 | 5} : {}) }
+    ...("initialChoices" in record ? {initialChoices: record.initialChoices as 1 | 2 | 3 | 4 | 5} : {}),
+    ...("maxFooterRows" in record ? {maxFooterRows: record.maxFooterRows as 8 | 12 | 16} : {}) }
 
 }
 
@@ -1507,6 +1510,20 @@ export function writePersistedMetricsExpanded(
       version: 2, provider: BUNDLED_DEFAULT_PROVIDER, providers: {},
     }
     return {...current, metricsExpanded:expanded}
+  })
+}
+
+export function writePersistedMaxFooterRows(
+  rows: 8 | 12 | 16,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): void {
+  if (!FOOTER_MAX_ROWS_OPTIONS.includes(rows)) throw new Error("invalid footer maximum")
+  updatePersistedInferenceDocument(env, state => {
+    if (state.kind === "invalid" || state.kind === "operational-error") throw new Error("settings need repair")
+    const current: PersistedInferenceDocument = state.kind === "valid" ? state.document : {
+      version: 2, provider: BUNDLED_DEFAULT_PROVIDER, providers: {},
+    }
+    return {...current, maxFooterRows: rows}
   })
 }
 
@@ -2066,17 +2083,24 @@ export const DETAILS_FOOTER_HEIGHT = 12
 // The finalized footer receipt (workbench.ts run()) and shellq.plugin.zsh's
 // peak-height check must both accept this bound.
 export const ASK_STREAM_MAX_FOOTER_HEIGHT = 16
+export const FOOTER_MAX_ROWS_OPTIONS = [8, 12, 16] as const
+export const DEFAULT_FOOTER_MAX_ROWS = 12
 
 // Maps rendered Ask content rows onto the promoted envelope in fixed steps
 // (8 → 12 → 16), never below the eight-row reader promotion and never past
-// the smaller of `ASK_STREAM_MAX_FOOTER_HEIGHT` and one row less than the
-// physical terminal (the ZLE prompt keeps its own row). `contentLines`
-// includes the composer row; the two border rows are added here.
-export function steppedAskFooterHeight(contentLines: number, terminalRows: number): number {
+// the smaller of the configured `maxRows`, `ASK_STREAM_MAX_FOOTER_HEIGHT`,
+// and one row less than the physical terminal (the ZLE prompt keeps its own
+// row). `contentLines` includes the composer row; the two border rows are
+// added here.
+export function steppedAskFooterHeight(
+  contentLines: number,
+  terminalRows: number,
+  maxRows: number = ASK_STREAM_MAX_FOOTER_HEIGHT,
+): number {
   const needed = Math.max(0, contentLines) + 2
   const ceiling = Math.max(
     1,
-    Math.min(ASK_STREAM_MAX_FOOTER_HEIGHT, terminalRows - 1),
+    Math.min(maxRows, ASK_STREAM_MAX_FOOTER_HEIGHT, terminalRows - 1),
   )
   for (const step of [4, READER_FOOTER_HEIGHT, DETAILS_FOOTER_HEIGHT, ASK_STREAM_MAX_FOOTER_HEIGHT]) {
     if (needed <= step) return Math.min(step, ceiling)
@@ -2864,6 +2888,7 @@ export type SettingsPaletteView = "root" | "model" | "effort" | "provider" | "mo
 export type UniversalPaletteKind = "set" | "toggle" | "open" | "guard" | "n-a"
 export type UniversalPaletteAction =
   | "set-initial-choices"
+  | "set-max-footer-rows"
   | "open-palette-view"
   | "toggle-context"
   | "mode-ask"
@@ -2996,6 +3021,7 @@ export function universalPaletteStatus(
 
 export type UniversalPaletteBuildContext = {
   initialChoices?: number
+  maxFooterRows?: number
   providerId: ProviderId | null
   providerSource: ProviderSource
   model: string
@@ -3597,6 +3623,15 @@ export function buildUniversalPaletteSources(
       kind: "set", action: "set-initial-choices", order: order++,
       effect: "saved globally for the next Command/Fix request; custom providers keep one",
     }), current: count === (context.initialChoices ?? 3)})
+  }
+
+  for (const [rowsIndex, rows] of FOOTER_MAX_ROWS_OPTIONS.entries()) {
+    records.push({...paletteRecord(context, {
+      authorityKey: "max-footer-rows", field: "action", sourceIndex: rowsIndex,
+      value: String(rows), label: `Max height ${rows} rows${rows === DEFAULT_FOOTER_MAX_ROWS ? " (default)" : ""}`,
+      kind: "set", action: "set-max-footer-rows", order: order++,
+      effect: "saved globally for the next workbench; the open frame keeps its height",
+    }), current: rows === (context.maxFooterRows ?? DEFAULT_FOOTER_MAX_ROWS)})
   }
 
   if (hasCapturedContext && !editing && viewIsMain) {
@@ -4454,11 +4489,17 @@ export function requestedFooterHeight(state: {
   settingsOpen: boolean
   terminalRows?: number
   view: WorkbenchView
+  // Configured session maximum from the settings document; the fixed
+  // eight-row returns below are the floor at the minimum offered cap.
+  maxRows?: number
 }): number {
-  if (state.view === "details" || state.view === "doctor") return DETAILS_FOOTER_HEIGHT
+  const maxRows = state.maxRows ?? ASK_STREAM_MAX_FOOTER_HEIGHT
+  if (state.view === "details" || state.view === "doctor") {
+    return Math.max(READER_FOOTER_HEIGHT, Math.min(DETAILS_FOOTER_HEIGHT, maxRows))
+  }
   if (state.settingsOpen) return READER_FOOTER_HEIGHT
   if (state.phase === "candidate" && !state.actionsOpen && !isEditingMode(state.editorMode)) {
-    return Math.max(READER_FOOTER_HEIGHT, steppedAskFooterHeight(state.candidateContentLines ?? 0, state.terminalRows ?? Number.MAX_SAFE_INTEGER))
+    return Math.max(READER_FOOTER_HEIGHT, steppedAskFooterHeight(state.candidateContentLines ?? 0, state.terminalRows ?? Number.MAX_SAFE_INTEGER, maxRows))
   }
   if (
     state.actionsOpen ||
@@ -4473,17 +4514,19 @@ export function requestedFooterHeight(state: {
   // effect only ever raises the renderer's live footer height.
   if (state.phase === "streaming" && state.intent !== "ask") {
     return Math.min(DETAILS_FOOTER_HEIGHT, steppedAskFooterHeight(
-      state.askContentLines ?? 0, state.terminalRows ?? Number.MAX_SAFE_INTEGER,
+      state.askContentLines ?? 0, state.terminalRows ?? Number.MAX_SAFE_INTEGER, maxRows,
     ))
   }
   if ((state.phase === "loading" && state.intent === "ask") || state.phase === "streaming" || state.phase === "answer") {
     return steppedAskFooterHeight(
       state.askContentLines ?? 0,
       state.terminalRows ?? Number.MAX_SAFE_INTEGER,
+      maxRows,
     )
   }
   if (state.previewVisible) return READER_FOOTER_HEIGHT
   return Math.min(
+    maxRows,
     READER_FOOTER_HEIGHT,
     COMPACT_FOOTER_HEIGHT + Math.max(0, state.composerLines - 1),
   )

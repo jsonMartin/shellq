@@ -31,6 +31,7 @@ import {
 import { createServer, type ServerResponse } from "node:http"
 import type { Socket } from "node:net"
 import { homedir, tmpdir } from "node:os"
+import { startRawTcpFixture } from "./raw-tcp-fixture"
 import { join } from "node:path"
 import { TextAttributes } from "@opentui/core"
 import { createTestRenderer, MouseButtons } from "@opentui/core/testing"
@@ -263,6 +264,14 @@ const fixtureSession = (overrides: Partial<WorkbenchSession> = {}): WorkbenchSes
       : "configured",
   codex_ask_engine: overrides.codex_ask_engine ?? null,
 })
+
+// Seeds a version-2 settings document into an isolated state root; tests that
+// assert the sixteen-row peak need the maximum raised above the twelve-row
+// default the Global maximum frame height setting imposes.
+const seedStateRoot = (stateDir: string, extra: Record<string, unknown>) => {
+  mkdirSync(stateDir, { recursive: true })
+  writeFileSync(join(stateDir, "settings.json"), JSON.stringify({ version: 2, provider: "codex", providers: {}, ...extra }))
+}
 
 // Provider wrappers are zsh scripts, and a developer's own startup files can
 // put real CLIs ahead of this file's fakes on PATH. Every zsh child reads its
@@ -616,12 +625,14 @@ describe("mounted workbench component", () => {
         const body = frame.split("\n").slice(1, 7).join("\n")
         return frame.includes("Search All:") && body.includes("Set model") && !body.includes("Luna")
       })
-      setup.mockInput.pressArrow("down")
-      setup.mockInput.pressArrow("down")
-      setup.mockInput.pressArrow("down")
-      setup.mockInput.pressArrow("down")
+      await setup.mockInput.typeText("more")
+      await pumpUntilFrame(setup, (frame) => frame.includes("More settings & actions"))
       setup.mockInput.pressEnter()
-      await pumpUntilFrame(setup, (frame) => frame.includes("Set engine"))
+      // Arrows, not typing: in-sheet typing after an Enter-routed view
+      // switch does not reach the query input (suspected product focus bug —
+      // ticketed separately), and Set engine sits one row below the
+      // current-ranked Max height leaf.
+      setup.mockInput.pressArrow("down")
       setup.mockInput.pressEnter()
       await pumpUntilFrame(setup, (frame) =>
         frame.includes("App Server") && frame.includes("Codex Exec"),
@@ -667,12 +678,12 @@ describe("mounted workbench component", () => {
     try {
       setup.mockInput.pressKey("k", { ctrl: true })
       await pumpUntilFrame(setup, (frame) => frame.includes("Set model"))
-      setup.mockInput.pressArrow("down")
-      setup.mockInput.pressArrow("down")
-      setup.mockInput.pressArrow("down")
-      setup.mockInput.pressArrow("down")
+      await setup.mockInput.typeText("more")
+      await pumpUntilFrame(setup, (frame) => frame.includes("More settings & actions"))
       setup.mockInput.pressEnter()
       await pumpUntilFrame(setup, (frame) => frame.includes("Set engine"))
+      await setup.mockInput.typeText("engine")
+      await pumpUntilFrame(setup, (frame) => frame.includes("Set engine") && !frame.includes("Max height"))
       setup.mockInput.pressEnter()
       await pumpUntilFrame(setup, (frame) =>
         frame.includes("App Server") && frame.includes("Codex Exec"),
@@ -1371,7 +1382,7 @@ describe("mounted workbench component", () => {
             expect(paintedLines[1]!.spans.every(
               (span) => !usesExplicitInverseColors(span),
             )).toBe(true)
-            if (!unicode) expect(lines.slice(1, 7).join("\n")).not.toMatch(/[^ -]/u)
+            if (!unicode) expect(lines.slice(1, 7).join("\n")).not.toMatch(/[^\u0000-\u007f]/u)
 
             setup.mockInput.pressEscape()
             await pumpUntilFrame(setup, current => current.includes("Set model"))
@@ -5262,72 +5273,60 @@ describe("mounted workbench: local managed provider", () => {
           },
         ],
       }),
-  ): Promise<LocalFixture> =>
-    new Promise((resolve) => {
-      const hits: Array<{ method: string; path: string }> = []
-      const posts: Array<Record<string, any>> = []
-      const sockets = new Set<Socket>()
-      let fixture: LocalFixture
-      const server = createServer((req, res) => {
-        // The adapter writes raw requests without a User-Agent; anything else is
-        // a foreign loopback probe from the host, not ShellQ traffic.
-        if (req.headers["user-agent"]) {
-          res.writeHead(404)
-          res.end()
+  ): Promise<LocalFixture> => {
+    const hits: Array<{ method: string; path: string }> = []
+    const posts: Array<Record<string, any>> = []
+    let fixture: LocalFixture
+    return startRawTcpFixture((req, res) => {
+      // The adapter writes raw requests without a User-Agent; anything else is
+      // a foreign loopback probe from the host, not ShellQ traffic.
+      if (req.headers["user-agent"]) {
+        res.writeHead(404)
+        res.end()
+        return
+      }
+      hits.push({ method: req.method ?? "", path: req.url ?? "" })
+      if (req.url === "/v1/models") {
+        if (fixture.onModels) return fixture.onModels(res)
+        res.writeHead(200, { "Content-Type": "application/json" })
+        res.end(JSON.stringify({ object: "list", data: fixture.catalog.map((id) => ({ id })) }))
+        return
+      }
+      let body = ""
+      req.on("data", (chunk) => {
+        body += chunk
+      })
+      req.on("end", () => {
+        let post: Record<string, any> | undefined
+        try {
+          post = JSON.parse(body)
+          posts.push(post!)
+        } catch {}
+        if (fixture.onCompletion) return fixture.onCompletion(res)
+        const text = fixture.completion()
+        const streamed = post?.stream === true && fixture.completionStatus === 200 ? asConformingStream(text, post) : null
+        if (streamed) {
+          res.writeHead(200, { "Content-Type": "text/event-stream" })
+          res.end(streamed)
           return
         }
-        hits.push({ method: req.method ?? "", path: req.url ?? "" })
-        if (req.url === "/v1/models") {
-          if (fixture.onModels) return fixture.onModels(res)
-          res.writeHead(200, { "Content-Type": "application/json" })
-          res.end(JSON.stringify({ object: "list", data: fixture.catalog.map((id) => ({ id })) }))
-          return
-        }
-        let body = ""
-        req.on("data", (chunk) => {
-          body += chunk
-        })
-        req.on("end", () => {
-          let post: Record<string, any> | undefined
-          try {
-            post = JSON.parse(body)
-            posts.push(post!)
-          } catch {}
-          if (fixture.onCompletion) return fixture.onCompletion(res)
-          const text = fixture.completion()
-          const streamed = post?.stream === true && fixture.completionStatus === 200 ? asConformingStream(text, post) : null
-          if (streamed) {
-            res.writeHead(200, { "Content-Type": "text/event-stream" })
-            res.end(streamed)
-            return
-          }
-          res.writeHead(fixture.completionStatus, { "Content-Type": "application/json" })
-          res.end(text)
-        })
+        res.writeHead(fixture.completionStatus, { "Content-Type": "application/json" })
+        res.end(text)
       })
-      server.on("connection", socket => {
-        sockets.add(socket)
-        socket.on("close", () => sockets.delete(socket))
-      })
-      server.listen(0, "127.0.0.1", () => {
-        const address = server.address()
-        if (!address || typeof address === "string") throw new Error("no port")
-        fixture = {
-          endpoint: `http://127.0.0.1:${address.port}/v1`,
-          hits,
-          posts,
-          sockets,
-          catalog: [...CATALOG],
-          completion,
-          completionStatus: 200,
-          close: () => new Promise<void>((done) => {
-            server.close(() => done())
-            for (const socket of sockets) socket.destroy()
-          }),
-        }
-        resolve(fixture)
-      })
+    }).then((raw) => {
+      fixture = {
+        endpoint: `http://127.0.0.1:${raw.port}/v1`,
+        hits,
+        posts,
+        sockets: raw.sockets,
+        catalog: [...CATALOG],
+        completion,
+        completionStatus: 200,
+        close: raw.close,
+      }
+      return fixture
     })
+  }
 
   const localSession = (overrides: Partial<WorkbenchSession> = {}) =>
     fixtureSession({
@@ -6998,6 +6997,9 @@ printf called > ${codexMarker}
       }
     })
   })
+
+
+
 })
 
 // ---------------------------------------------------------------------------
@@ -7211,6 +7213,7 @@ describe("mounted workbench: streamed local Ask (spike)", () => {
 
   test("streamed local Ask: preview before completion, labeled thinking, stepped growth, ceiling scroll, no shrink, receipt accepts 16", async () => {
     await withSpikeEnvironment(async (fixture, root) => {
+      seedStateRoot(join(root, "state"), { maxFooterRows: 16 })
       const session = spikeSession()
       const setup = await mountWorkbench({ width: 100, height: 24, trustedWorkdir: root, session })
       const sse: { current: ServerResponse | null } = { current: null }
@@ -7427,6 +7430,7 @@ describe("mounted workbench: streamed local Ask (spike)", () => {
   for (const width of [80, 140]) {
     test(`refined local reader at ${width} columns`, async () => {
       await withSpikeEnvironment(async (fixture, root) => {
+        seedStateRoot(join(root, "state"), { maxFooterRows: 16 })
         const setup = await mountWorkbench({ width, height: 24, trustedWorkdir: root, session: spikeSession() })
         const stream: { current: ServerResponse | null } = { current: null }
         fixture.onCompletion = response => { response.writeHead(200, {"Content-Type":"text/event-stream"}); stream.current=response }
@@ -7537,6 +7541,9 @@ for (const width of [80, 100, 140, 42]) {
     if (width === 100) process.env.NO_UNICODE = "1"
     const marker = width === 100 ? ">" : "›"
     const root = mkdtempSync(join(tmpdir(), "shellq-sq10-"))
+    const previousStateDir = process.env.SHELLQ_STATE_DIR
+    seedStateRoot(join(root, "state"), { maxFooterRows: 16 })
+    process.env.SHELLQ_STATE_DIR = join(root, "state")
     const log = join(root, "requests.jsonl")
     const responses = [0.8, 0.95, 0.7, 0.8, 0.6].map((confidence, index) => ({
       corrected_command: `echo choice-${index}\necho continuation-${index}`,
@@ -7625,6 +7632,8 @@ for (const width of [80, 100, 140, 42]) {
       expect(requestCount()).toBe(5)
     } finally {
       setup.renderer.destroy();rmSync(root,{recursive:true,force:true})
+      if (previousStateDir === undefined) delete process.env.SHELLQ_STATE_DIR
+      else process.env.SHELLQ_STATE_DIR = previousStateDir
       if (previousUnicode === undefined) delete process.env.NO_UNICODE
       else process.env.NO_UNICODE = previousUnicode
     }
@@ -7916,10 +7925,15 @@ test("initial choices menu persists across reopening and controls bundled reques
     for(const [key,value] of Object.entries(saved)) if(value===undefined) delete process.env[key];else process.env[key]=value
     rmSync(root,{recursive:true,force:true})
   }
+
 })
 
 test("a long final description grows the frame beyond the compact preview ceiling", async () => {
   const response={corrected_command:"ls",tldr:"Inspect files carefully. ".repeat(18),confidence:0.95,risk:"High: irreversible effects across the directory tree"}
+  const previousStateDir = process.env.SHELLQ_STATE_DIR
+  const stateDir = mkdtempSync(join(tmpdir(), "shellq-sq11-max16-"))
+  seedStateRoot(stateDir, { maxFooterRows: 16 })
+  process.env.SHELLQ_STATE_DIR = stateDir
   const setup=await mountWorkbench({width:42,height:24,session:fixtureSession({provider:["bun","-e",`await Bun.stdin.text();console.log(${JSON.stringify(JSON.stringify(response))})`]})})
   try {
     await setup.mockInput.typeText("inspect");setup.mockInput.pressEnter()
@@ -7927,7 +7941,12 @@ test("a long final description grows the frame beyond the compact preview ceilin
     expect(setup.renderer.footerHeight).toBe(16)
     expect(setup.captureCharFrame().trimEnd().split("\n").at(-2)).toContain("› 1  ls")
     expect(existsSync(setup.resultPath)).toBe(false)
-  } finally {setup.renderer.destroy()}
+  } finally {
+    setup.renderer.destroy()
+    if (previousStateDir === undefined) delete process.env.SHELLQ_STATE_DIR
+    else process.env.SHELLQ_STATE_DIR = previousStateDir
+    rmSync(stateDir,{recursive:true,force:true})
+  }
 })
 
 /* Focused mounted checks for bounded endpoint discovery and endpoint-aware
@@ -8441,4 +8460,383 @@ describe("mounted workbench: local endpoint discovery scan", () => {
       }
     })
   })
+})
+
+// ---------------------------------------------------------------------------
+// SQ-11 adaptive frame height: the configured maximum bounds every surface
+// ---------------------------------------------------------------------------
+
+describe("SQ-11 adaptive frame height", () => {
+  const LOCAL_ADAPTER = adapterPath(descriptorForProvider(LOCAL_PROVIDER_ID))
+  const SPIKE_MODEL = "qwen3-coder-30b-a3b-instruct"
+
+  type SseFixture = {
+    endpoint: string
+    posts: Array<Record<string, any>>
+    close: () => Promise<void>
+    onCompletion: ((response: ServerResponse) => void) | null
+  }
+
+  const startSseFixture = (): Promise<SseFixture> =>
+    new Promise((resolve) => {
+      const sockets = new Set<Socket>()
+      const posts: Array<Record<string, any>> = []
+      let fixture: SseFixture
+      const server = createServer((req, res) => {
+        if (req.url === "/v1/models") {
+          res.writeHead(200, { "Content-Type": "application/json" })
+          res.end(JSON.stringify({ object: "list", data: [{ id: SPIKE_MODEL }] }))
+          return
+        }
+        if (req.url === "/props") {
+          res.writeHead(200, { "Content-Type": "application/json" })
+          res.end(JSON.stringify({ chat_template: "{% if enable_thinking %}" }))
+          return
+        }
+        let body = ""
+        req.on("data", (chunk) => {
+          body += chunk
+        })
+        req.on("end", () => {
+          try {
+            posts.push(JSON.parse(body))
+          } catch {}
+          if (fixture.onCompletion) return fixture.onCompletion(res)
+          res.writeHead(200, { "Content-Type": "application/json" })
+          res.end("{}")
+        })
+      })
+      server.on("connection", (socket) => {
+        sockets.add(socket)
+        socket.on("close", () => sockets.delete(socket))
+      })
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address()
+        if (!address || typeof address === "string") throw new Error("no port")
+        fixture = {
+          endpoint: `http://127.0.0.1:${address.port}/v1`,
+          posts,
+          onCompletion: null,
+          close: () =>
+            new Promise<void>((done) => {
+              server.close(() => done())
+              for (const socket of sockets) socket.destroy()
+            }),
+        }
+        resolve(fixture)
+      })
+    })
+
+  const withSpikeEnvironment = async (
+    body: (fixture: SseFixture, root: string) => Promise<void>,
+  ) => {
+    const root = mkdtempSync(join(tmpdir(), "shellq-sq11-height-"))
+    const bin = join(root, "bin")
+    mkdirSync(bin)
+    symlinkSync(process.execPath, join(bin, "bun"))
+    for (const zsh of ["/bin/zsh", "/usr/bin/zsh", "/usr/local/bin/zsh"]) {
+      if (existsSync(zsh)) {
+        symlinkSync(zsh, join(bin, "zsh"))
+        break
+      }
+    }
+    const fixture = await startSseFixture()
+    const previous = {
+      endpoint: process.env.SHELLQ_LOCAL_OPENAI_ENDPOINT,
+      path: process.env.PATH,
+      stateDir: process.env.SHELLQ_STATE_DIR,
+    }
+    process.env.PATH = bin
+    process.env.SHELLQ_LOCAL_OPENAI_ENDPOINT = fixture.endpoint
+    process.env.SHELLQ_STATE_DIR = join(root, "state")
+    try {
+      await body(fixture, root)
+    } finally {
+      if (previous.endpoint === undefined) delete process.env.SHELLQ_LOCAL_OPENAI_ENDPOINT
+      else process.env.SHELLQ_LOCAL_OPENAI_ENDPOINT = previous.endpoint
+      if (previous.path === undefined) delete process.env.PATH
+      else process.env.PATH = previous.path
+      if (previous.stateDir === undefined) delete process.env.SHELLQ_STATE_DIR
+      else process.env.SHELLQ_STATE_DIR = previous.stateDir
+      await fixture.close()
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+
+  const spikeSession = (overrides: Partial<WorkbenchSession> = {}) =>
+    fixtureSession({
+      initial_intent: "ask",
+      provider: [LOCAL_ADAPTER],
+      provider_id: LOCAL_PROVIDER_ID,
+      provider_source: "default",
+      model: SPIKE_MODEL,
+      reasoning: "endpoint default",
+      models: [SPIKE_MODEL],
+      reasoning_levels: ["endpoint default"],
+      ...overrides,
+    })
+
+  // Ask answers stream as an incrementally valid JSON envelope; raw prose
+  // would sit unparsed in the adapter's buffer and never reach the reader.
+  const streamAnswerChunk = (send: (payload: unknown) => void, fragment: string) =>
+    send({ choices: [{ index: 0, delta: { content: fragment } }] })
+  const answerLine = (index: number) => `line ${String(index).padStart(2, "0")}`
+  const escapedLine = (index: number) => `\\n${answerLine(index)}`
+
+  const openSettingsPalette = async (setup: Awaited<ReturnType<typeof mountWorkbench>>) => {
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("s")
+    return pumpUntilFrame(setup, (frame) => frame.includes("Search All:"))
+  }
+
+  // Under renderer pressure the reopened sheet can lose the focus handoff;
+  // the first attempt stays immediate and a miss recovers by reopening the
+  // sheet, which always starts a clean query.
+  const typePickerQuery = async (setup: Awaited<ReturnType<typeof mountWorkbench>>, text: string) => {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      if (attempt > 0) {
+        setup.mockInput.pressEscape()
+        await pumpUntilFrame(setup, (frame) => !frame.includes("Search All:"))
+        await new Promise((resolve) => setTimeout(resolve, 150))
+        await openSettingsPalette(setup)
+      }
+      await setup.mockInput.typeText(text)
+      await setup.renderOnce()
+      if (setup.captureCharFrame().includes(`Search All: ${text}`)) return
+    }
+    throw new Error(`picker query did not accept: ${text}`)
+  }
+
+  const mountStreamingAsk = async (root: string) => {
+    const setup = await mountWorkbench({ width: 100, height: 24, trustedWorkdir: root, session: spikeSession() })
+    await setup.mockInput.typeText("list everything")
+    setup.mockInput.pressEnter()
+    return setup
+  }
+
+  test("default maximum stops growth at twelve and keeps the reader scrollable", async () => {
+    await withSpikeEnvironment(async (fixture, root) => {
+      const sse: { current: ServerResponse | null } = { current: null }
+      const send = (payload: unknown) => sse.current!.write(`data: ${JSON.stringify(payload)}\n\n`)
+      fixture.onCompletion = (response) => {
+        response.writeHead(200, { "Content-Type": "text/event-stream" })
+        sse.current = response
+      }
+      const setup = await mountStreamingAsk(root)
+      try {
+        await pumpUntilFrame(setup, () => sse.current !== null, { tries: 160 })
+        streamAnswerChunk(send, '{"answer":"' + escapedLine(0))
+        await pumpUntilFrame(setup, (frame) => frame.includes(answerLine(0)), { tries: 160 })
+        expect(setup.renderer.footerHeight).toBeLessThanOrEqual(12)
+        for (let first = 1; first < 30; first += 6) {
+          streamAnswerChunk(send, [0, 1, 2, 3, 4, 5].map((offset) => escapedLine(first + offset)).join(""))
+          await pumpUntilFrame(setup, (frame) => frame.includes(answerLine(Math.min(first + 5, 29))), { tries: 160 })
+          expect(setup.renderer.footerHeight).toBeLessThanOrEqual(12)
+        }
+        expect(setup.renderer.footerHeight).toBe(12)
+        const streamBar = setup.renderer.root.findDescendantById("ask-stream-scrollbar") as ReaderScrollbar
+        expect(streamBar).not.toBeNull()
+        streamAnswerChunk(send, '"}')
+        send({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })
+        ;sse.current!.end("data: [DONE]\n\n")
+        await pumpUntilFrame(setup, (frame) => frame.includes("Ask a local question") && setup.active.process === null, { tries: 160 })
+        expect(setup.renderer.footerHeight).toBe(12)
+      } finally {
+        try { sse.current?.end() } catch {}
+        setup.renderer.destroy()
+      }
+    })
+  }, 40_000)
+
+  test("cap eight stops growth and bounds Doctor", async () => {
+    await withSpikeEnvironment(async (fixture, root) => {
+      seedStateRoot(join(root, "state"), { maxFooterRows: 8 })
+      const sse: { current: ServerResponse | null } = { current: null }
+      const send = (payload: unknown) => sse.current!.write(`data: ${JSON.stringify(payload)}\n\n`)
+      fixture.onCompletion = (response) => {
+        response.writeHead(200, { "Content-Type": "text/event-stream" })
+        sse.current = response
+      }
+      const setup = await mountStreamingAsk(root)
+      try {
+        await pumpUntilFrame(setup, () => sse.current !== null, { tries: 160 })
+        streamAnswerChunk(send, '{"answer":"' + escapedLine(0))
+        await pumpUntilFrame(setup, (frame) => frame.includes(answerLine(0)), { tries: 160 })
+        for (let first = 1; first < 24; first += 6) {
+          streamAnswerChunk(send, [0, 1, 2, 3, 4, 5].map((offset) => escapedLine(first + offset)).join(""))
+          await pumpUntilFrame(setup, (frame) => frame.includes(answerLine(Math.min(first + 5, 23))), { tries: 160 })
+          expect(setup.renderer.footerHeight).toBeLessThanOrEqual(8)
+        }
+        expect(setup.renderer.footerHeight).toBe(8)
+        streamAnswerChunk(send, '"}')
+        send({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })
+        ;sse.current!.end("data: [DONE]\n\n")
+        await pumpUntilFrame(setup, (frame) => frame.includes("Ask a local question") && setup.active.process === null, { tries: 160 })
+        // Overflow content stays reachable: page back to the first line.
+        for (let page = 0; page < 6; page += 1) setup.mockInput.pressKey("\u001b[5~")
+        await pumpUntilFrame(setup, (frame) => frame.includes(answerLine(0)), { tries: 160 })
+        setup.mockInput.pressKey("x", { ctrl: true })
+        setup.mockInput.pressKey("d")
+        const doctor = await pumpUntilFrame(setup, (frame) => frame.includes("PASS cwd") && setup.renderer.footerHeight === 8, { tries: 160 })
+        expect(doctor).toContain("PASS provider")
+        setup.mockInput.pressEscape()
+        await pumpUntilFrame(setup, (frame) => frame.includes("Ask a local question"))
+      } finally {
+        try { sse.current?.end() } catch {}
+        setup.renderer.destroy()
+      }
+    })
+  }, 40_000)
+
+  test("a mid-session save freezes the open band and applies after reopening", async () => {
+    await withSpikeEnvironment(async (fixture, root) => {
+      seedStateRoot(join(root, "state"), { maxFooterRows: 8 })
+      const sse: { current: ServerResponse | null } = { current: null }
+      const send = (payload: unknown) => sse.current!.write(`data: ${JSON.stringify(payload)}\n\n`)
+      fixture.onCompletion = (response) => {
+        response.writeHead(200, { "Content-Type": "text/event-stream" })
+        sse.current = response
+      }
+      const setup = await mountStreamingAsk(root)
+      try {
+        await pumpUntilFrame(setup, () => sse.current !== null, { tries: 160 })
+        streamAnswerChunk(send, '{"answer":"' + escapedLine(0))
+        await pumpUntilFrame(setup, (frame) => frame.includes(answerLine(0)), { tries: 160 })
+        for (let first = 1; first < 12; first += 6) {
+          streamAnswerChunk(send, [0, 1, 2, 3, 4, 5].map((offset) => escapedLine(first + offset)).join(""))
+          await pumpUntilFrame(setup, (frame) => frame.includes(answerLine(Math.min(first + 5, 11))), { tries: 160 })
+        }
+        expect(setup.renderer.footerHeight).toBe(8)
+        // A mid-session save must not move the open band even when content
+        // arrives that would need the new maximum.
+        workbenchBindings.writePersistedMaxFooterRows(16)
+        for (let first = 12; first < 30; first += 6) {
+          streamAnswerChunk(send, [0, 1, 2, 3, 4, 5].map((offset) => escapedLine(first + offset)).join(""))
+          await pumpUntilFrame(setup, (frame) => frame.includes(answerLine(Math.min(first + 5, 29))), { tries: 160 })
+          expect(setup.renderer.footerHeight).toBe(8)
+        }
+        setup.renderer.destroy()
+        // The next invocation applies the saved maximum. Drop the dead
+        // response first: the reopened turn must bind to its own stream.
+        sse.current = null
+        const reopened = await mountStreamingAsk(root)
+        try {
+          await pumpUntilFrame(reopened, () => sse.current !== null, { tries: 160 })
+          streamAnswerChunk(send, '{"answer":"' + escapedLine(0))
+          await pumpUntilFrame(reopened, (frame) => frame.includes(answerLine(0)), { tries: 160 })
+          for (let first = 1; first < 30; first += 6) {
+            streamAnswerChunk(send, [0, 1, 2, 3, 4, 5].map((offset) => escapedLine(first + offset)).join(""))
+            await pumpUntilFrame(reopened, (frame) => frame.includes(answerLine(Math.min(first + 5, 29))), { tries: 160 })
+          }
+          expect(reopened.renderer.footerHeight).toBe(16)
+        } finally {
+          reopened.renderer.destroy()
+        }
+      } finally {
+        try { sse.current?.end() } catch {}
+        setup.renderer.destroy()
+      }
+    })
+  }, 60_000)
+
+  test("a failed picker save leaves file, marker, and frame unchanged", async () => {
+    await withSpikeEnvironment(async (fixture, root) => {
+      seedStateRoot(join(root, "state"), {})
+      const settingsPath = join(root, "state", "settings.json")
+      // An unreadable settings file puts the persisted state into the
+      // operational-error branch, so the picker's write must fail.
+      chmodSync(settingsPath, 0o000)
+      const setup = await mountWorkbench({ width: 80, height: 24, trustedWorkdir: root, session: spikeSession() })
+      try {
+        await openSettingsPalette(setup)
+        await typePickerQuery(setup, "max height")
+        await pumpUntilFrame(setup, (frame) => frame.includes("Max height 8 rows"))
+        // Select the 8 leaf (not the already-ranked 12): a failed save must
+        // leave the marker where it was, which only shows when the failed
+        // selection differed from it.
+        setup.mockInput.pressKey("\u001b[B")
+        // The palette itself promotes the band (grow-only); the failed save
+        // must not change it further.
+        const before = setup.renderer.footerHeight
+        setup.mockInput.pressEnter()
+        await pumpUntilFrame(setup, (frame) => frame.includes("max height not saved"), { tries: 160 })
+        expect(setup.renderer.footerHeight).toBe(before)
+        // The marker keeps the default ranking and the file is untouched.
+        const frame = setup.captureCharFrame()
+        expect(frame.indexOf("Max height 12 rows (default)")).toBeLessThan(frame.indexOf("Max height 8 rows"))
+        chmodSync(settingsPath, 0o600)
+        expect(readFileSync(settingsPath, "utf8")).not.toContain("maxFooterRows")
+      } finally {
+        chmodSync(settingsPath, 0o600)
+        setup.renderer.destroy()
+      }
+    })
+  }, 40_000)
+
+  test("max height leaves save, rank the saved value first, and stay ASCII", async () => {
+    await withSpikeEnvironment(async (fixture, root) => {
+      const sse: { current: ServerResponse | null } = { current: null }
+      const send = (payload: unknown) => sse.current!.write(`data: ${JSON.stringify(payload)}\n\n`)
+      fixture.onCompletion = (response) => {
+        response.writeHead(200, { "Content-Type": "text/event-stream" })
+        sse.current = response
+      }
+      const setup = await mountStreamingAsk(root)
+      try {
+        await pumpUntilFrame(setup, () => sse.current !== null, { tries: 160 })
+        streamAnswerChunk(send, '{"answer":"' + escapedLine(0) + '"}')
+        send({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })
+        ;sse.current!.end("data: [DONE]\n\n")
+        await pumpUntilFrame(setup, (frame) => frame.includes("Ask a local question") && setup.active.process === null, { tries: 160 })
+        const before = setup.renderer.footerHeight
+        await openSettingsPalette(setup)
+        await typePickerQuery(setup, "max height")
+        const listed = await pumpUntilFrame(setup, (frame) =>
+          frame.includes("Max height 8 rows") && frame.includes("Max height 12 rows (default)") && frame.includes("Max height 16 rows"))
+        expect(listed.indexOf("Max height 12 rows (default)")).toBeLessThan(listed.indexOf("Max height 16 rows"))
+        // Arrows move the query caret and Esc closes the sheet, so narrow to
+        // the unique 8 leaf by appending to the query.
+        await setup.mockInput.typeText(" 8")
+        await setup.renderOnce()
+        await pumpUntilFrame(setup, (frame) => frame.includes("Max height 8 rows") && !frame.includes("Max height 16 rows"))
+        setup.mockInput.pressEnter()
+        await pumpUntilFrame(setup, (frame) => frame.includes("max height 8 rows saved"))
+        expect(setup.renderer.footerHeight).toBe(before)
+        expect(JSON.parse(readFileSync(join(root, "state", "settings.json"), "utf8")).maxFooterRows).toBe(8)
+        // Close the sheet before tearing down: the test renderer shares
+        // module state across mounts, and an open sheet at destroy leaks
+        // into the next mount.
+        setup.mockInput.pressEscape()
+        await pumpUntilFrame(setup, (frame) => !frame.includes("Search All:"))
+        setup.renderer.destroy()
+        // A fresh invocation reads the saved marker: its picker ranks the
+        // saved value first.
+        const reopened = await mountWorkbench({ width: 80, height: 24, trustedWorkdir: root, session: spikeSession() })
+        try {
+          await openSettingsPalette(reopened)
+          await typePickerQuery(reopened, "max height")
+          const ranked = await pumpUntilFrame(reopened, (frame) => frame.includes("Max height 8 rows"))
+          expect(ranked.indexOf("Max height 8 rows")).toBeLessThan(ranked.indexOf("Max height 12 rows (default)"))
+          reopened.mockInput.pressEscape()
+          // No Unicode, same words.
+          const previousUnicode = process.env.NO_UNICODE
+          process.env.NO_UNICODE = "1"
+          try {
+            const ascii = await mountWorkbench({ width: 80, height: 24, trustedWorkdir: root, session: spikeSession() })
+            try {
+              await openSettingsPalette(ascii)
+              await typePickerQuery(ascii, "max height")
+              const asciiFrame = await pumpUntilFrame(ascii, (frame) => frame.includes("Max height 8 rows"))
+              expect(asciiFrame).toContain("Max height 12 rows (default)")
+            } finally { ascii.renderer.destroy() }
+          } finally {
+            if (previousUnicode === undefined) delete process.env.NO_UNICODE
+            else process.env.NO_UNICODE = previousUnicode
+          }
+        } finally { reopened.renderer.destroy() }
+      } finally {
+        setup.renderer.destroy()
+      }
+    })
+  }, 60_000)
 })

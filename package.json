@@ -1,6 +1,6 @@
 {
   "name": "shellq",
-  "version": "1.0.0-beta.2",
+  "version": "1.0.0-beta.4",
   "description": "AI help for zsh at your prompt: commands, fixes and answers, reviewed before anything runs",
   "private": true,
   "license": "MIT",

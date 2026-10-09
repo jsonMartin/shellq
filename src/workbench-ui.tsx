@@ -136,6 +136,8 @@ import {
   writePersistedLocalThinking,
   writePersistedMetricsExpanded,
   writePersistedInitialChoices,
+  writePersistedMaxFooterRows,
+  DEFAULT_FOOTER_MAX_ROWS,
   type ActionsSheetAction,
   type ActionsSheetCell,
   type AskPreviewEvent,
@@ -336,6 +338,18 @@ const Workbench = ({
     return state.kind === "valid" ? state.document.initialChoices ?? 3 : 3
   })
   const initialChoicesRef = useRef(initialChoices)
+  // The cap is frozen for this invocation: the live band must not re-read a
+  // mid-session save, so mount-time state and the picker's saved marker stay
+  // separate values.
+  const [sessionMaxFooterRows] = useState<8 | 12 | 16>(() => {
+    const state = readPersistedInferenceDocumentState()
+    return state.kind === "valid" ? state.document.maxFooterRows ?? DEFAULT_FOOTER_MAX_ROWS : DEFAULT_FOOTER_MAX_ROWS
+  })
+  const [savedMaxFooterRows, setSavedMaxFooterRows] = useState<8 | 12 | 16>(() => {
+    const state = readPersistedInferenceDocumentState()
+    return state.kind === "valid" ? state.document.maxFooterRows ?? DEFAULT_FOOTER_MAX_ROWS : DEFAULT_FOOTER_MAX_ROWS
+  })
+  const savedMaxFooterRowsRef = useRef(savedMaxFooterRows)
   const [initialEndpoint] = useState(() => session.localEndpoint ?? resolveLocalEndpoint(readPersistedInferenceDocumentState(), process.env))
   const endpointStateRef = useRef(initialEndpoint)
   const [localThinkingPreferences, setLocalThinkingPreferences] = useState(() => {
@@ -746,6 +760,7 @@ const Workbench = ({
     composerLines,
     editorMode,
     intent,
+    maxRows: sessionMaxFooterRows,
     phase,
     previewVisible,
     settingsOpen: Boolean(settingsOpen),
@@ -1345,6 +1360,7 @@ const Workbench = ({
     local: Record<string, ProviderCapabilityCatalog> = localCatalogs,
   ) => buildUniversalPaletteSources({
     initialChoices: initialChoicesRef.current,
+    maxFooterRows: savedMaxFooterRowsRef.current,
       availableProviders: providerAvailability().map(({ id, models, reasoningLevels, selectable }) => ({
         id,
         models,
@@ -1953,7 +1969,8 @@ const Workbench = ({
     const fresh = paintedIndex === undefined
       ? ranked[focusIndex]
       : settingsPickerWindow(ranked, focusIndex, pickerVisibleRows)[paintedIndex]
-    const paintedDestinationChanged = selected?.kind === "set" && selected.action !== "set-initial-choices" && (
+    const paintedDestinationChanged = selected?.kind === "set" && selected.action !== "set-initial-choices" &&
+      selected.action !== "set-max-footer-rows" && (
       fresh?.kind !== "set" ||
       !selected.destination ||
       !fresh.destination ||
@@ -1980,6 +1997,17 @@ const Workbench = ({
         resetPickerQuery()
         setPickerStatus(`${count} initial ${count === 1 ? "choice" : "choices"} saved globally`)
       } catch { setPickerStatus("choice count not saved · settings need attention") }
+      return
+    }
+    if (fresh.action === "set-max-footer-rows") {
+      const rows = Number(fresh.value) as 8 | 12 | 16
+      try {
+        writePersistedMaxFooterRows(rows)
+        savedMaxFooterRowsRef.current = rows
+        setSavedMaxFooterRows(rows)
+        resetPickerQuery()
+        setPickerStatus(`max height ${rows} rows saved for the next workbench`)
+      } catch { setPickerStatus("max height not saved · settings need attention") }
       return
     }
     if (fresh.kind === "set") {

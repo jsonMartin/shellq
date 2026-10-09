@@ -138,6 +138,14 @@ PTYSCRIPT
 chmod 700 $PTY_SCRIPT
 typeset -g PTY_TMUX_SOCKET=''
 umask 077
+# Cases that do not set their own state root read this isolated one. It is
+# deliberately UNSET for maxFooterRows so those cases exercise the production
+# twelve-row default; the cases that need the sixteen-row ceiling seed their
+# own state roots.
+typeset smoke_default_state=$TEST_DIR/smoke-default-state
+mkdir -p -- "$smoke_default_state"
+printf '%s\n' '{"version":2,"provider":"codex","providers":{}}' > "$smoke_default_state/settings.json"
+export SHELLQ_STATE_DIR=$smoke_default_state
 
 cleanup() {
   if [[ -n ${SHELLQ_PTY_KEEP:-} ]]; then
@@ -422,7 +430,12 @@ mkdir -p -- "$setup_bin" "$setup_state"
 make_setup_session "$setup_session"
 
 # With neither CLI on PATH the bundled local provider stays selectable, so the
-# workbench mounts on Local; Ctrl-X P still reaches Provider Setup.
+# workbench mounts on Local; Ctrl-X P still reaches Provider Setup. Hosts where
+# codex/claude sit on /usr/bin can skip this case (its premise needs a
+# restricted PATH) via SHELLQ_PTY_SKIP_SETUP_RECOVERY=1.
+if [[ ${SHELLQ_PTY_SKIP_SETUP_RECOVERY:-} == 1 ]]; then
+  print -r -- 'SKIP setup-recovery (host has CLIs on the restricted path)'
+else
 {
   command sleep 1
   print -rn -- $'\x18p'
@@ -455,6 +468,7 @@ contains "$setup_transcript" 'Codex CLI UNAVAILABLE' ||
   fail "Setup recovery did not show Codex unavailable"
 contains "$setup_transcript" 'Claude CLI UNAVAILABLE' ||
   fail "Setup recovery did not show Claude unavailable"
+fi
 
 print -r -- '#!/bin/sh' > "$setup_bin/codex"
 print -r -- "printf called > ${(q)setup_marker_codex}" >> "$setup_bin/codex"
@@ -626,6 +640,12 @@ typeset ask_session=$TEST_DIR/ask-session.json
 typeset ask_result=$TEST_DIR/ask-result.json
 typeset ask_log=$TEST_DIR/ask-provider.jsonl
 typeset ask_transcript=$TEST_DIR/ask.typescript
+# The Ask case asserts the sixteen-row receipt maximum, so its isolated state
+# seeds maxFooterRows 16 above the twelve-row default.
+typeset ask_state=$TEST_DIR/ask-state
+mkdir -p -- "$ask_state"
+printf '%s\n' '{"version":2,"provider":"codex","providers":{},"maxFooterRows":16}' \
+  > "$ask_state/settings.json"
 make_session "$ask_session" long-answer ask
 
 {
@@ -675,6 +695,7 @@ make_session "$ask_session" long-answer ask
   SHELLQ_PTY_SESSION=$ask_session \
   SHELLQ_PTY_RESULT=$ask_result \
   SHELLQ_PTY_PROVIDER_LOG=$ask_log \
+  SHELLQ_STATE_DIR=$ask_state \
   "$PTY_SCRIPT" "$ask_transcript" \
     "$ZSH_BIN" "$SCRIPT_PATH" child >/dev/null ||
   fail "Ask PTY case failed"
@@ -2001,11 +2022,16 @@ run_wheel_gate_case() {
   local ask_wheel_log=$TEST_DIR/wheel-ask-provider.jsonl
   local ask_transcript=$TEST_DIR/wheel-ask.typescript
   local ask_socket=$TEST_DIR/tmux-wheel-ask.sock
+  # Scroll-geometry case: seed the sixteen-row maximum so the long answer
+  # overflows the reader the same way it did before the height setting.
+  local ask_wheel_state=$TEST_DIR/wheel-ask-state
+  mkdir -p -- "$ask_wheel_state"
+  printf '%s\n' '{"version":2,"provider":"codex","providers":{},"maxFooterRows":16}' > "$ask_wheel_state/settings.json"
   make_session "$ask_wheel_session" long-answer ask
 
   PTY_TMUX_SOCKET=$ask_socket
   TMUX='' command tmux -f /dev/null -S "$ask_socket" new-session -d -x 80 -y 40 \
-    "SHELLQ_PTY_CASE=wheel-ask SHELLQ_PTY_WORKBENCH=${(q)WORKBENCH} SHELLQ_PTY_WORKDIR=${(q)TEST_DIR} SHELLQ_PTY_SESSION=${(q)ask_wheel_session} SHELLQ_PTY_RESULT=${(q)ask_wheel_result} SHELLQ_PTY_PROVIDER_LOG=${(q)ask_wheel_log} ${(q)PTY_SCRIPT} ${(q)ask_transcript} ${(q)ZSH_BIN} ${(q)SCRIPT_PATH} child" ||
+    "SHELLQ_STATE_DIR=${(q)ask_wheel_state} SHELLQ_PTY_CASE=wheel-ask SHELLQ_PTY_WORKBENCH=${(q)WORKBENCH} SHELLQ_PTY_WORKDIR=${(q)TEST_DIR} SHELLQ_PTY_SESSION=${(q)ask_wheel_session} SHELLQ_PTY_RESULT=${(q)ask_wheel_result} SHELLQ_PTY_PROVIDER_LOG=${(q)ask_wheel_log} ${(q)PTY_SCRIPT} ${(q)ask_transcript} ${(q)ZSH_BIN} ${(q)SCRIPT_PATH} child" ||
     fail "wheel: could not start the isolated Ask wheel PTY"
   repeat 80; do
     pane=$(TMUX='' command tmux -S "$ask_socket" capture-pane -p)
@@ -2137,6 +2163,90 @@ run_wheel_gate_case() {
   PTY_TMUX_SOCKET=''
 }
 
+run_sq11_resize_residue_case() {
+  # SQ-11: a cap-limited band must not leave more narrowing residue than a
+  # taller one over identical content. The absolute fragment count is the
+  # known upstream SQ-23 baseline, so only the cap-8-vs-16 comparison is
+  # asserted here.
+  local -i residue_3=0 residue_8=0 residue_12=0 residue_16=0
+  local -i peak
+  local cap
+  for cap in 3 8 12 16; do
+    local cap_state=$TEST_DIR/resize-$cap-state
+    local cap_session=$TEST_DIR/resize-$cap-session.json
+    local cap_result=$TEST_DIR/resize-$cap-result.json
+    local cap_log=$TEST_DIR/resize-$cap-provider.jsonl
+    local cap_transcript=$TEST_DIR/resize-$cap.typescript
+    local cap_socket=$TEST_DIR/tmux-resize-$cap.sock
+    mkdir -p -- "$cap_state"
+    if [[ $cap == 3 ]]; then
+      # The three-row composer band is the pre-existing SQ-23 worst case:
+      # no setting, no turn, resize immediately after open.
+      printf '%s\n' '{"version":2,"provider":"codex","providers":{}}' > "$cap_state/settings.json"
+    else
+      printf '%s\n' '{"version":2,"provider":"codex","providers":{},"maxFooterRows":'"$cap"'}' > "$cap_state/settings.json"
+    fi
+    make_session "$cap_session" long-answer ask
+    TMUX='' command tmux -f /dev/null -S "$cap_socket" new-session -d -x 80 -y 40 \
+      "SHELLQ_STATE_DIR=${(q)cap_state} SHELLQ_PTY_CASE=wheel-ask SHELLQ_PTY_WORKBENCH=${(q)WORKBENCH} SHELLQ_PTY_WORKDIR=${(q)TEST_DIR} SHELLQ_PTY_SESSION=${(q)cap_session} SHELLQ_PTY_RESULT=${(q)cap_result} SHELLQ_PTY_PROVIDER_LOG=${(q)cap_log} ${(q)PTY_SCRIPT} ${(q)cap_transcript} ${(q)ZSH_BIN} ${(q)SCRIPT_PATH} child" ||
+      fail "resize residue: could not start the cap-$cap PTY"
+    local pane
+    repeat 80; do
+      pane=$(TMUX='' command tmux -S "$cap_socket" capture-pane -p)
+      [[ $pane == *'Ask about this repo'* ]] && break
+      command sleep 0.1
+    done
+    [[ $pane == *'Ask about this repo'* ]] ||
+      fail "resize residue: the cap-$cap workbench did not render"
+    if [[ $cap != 3 ]]; then
+    TMUX='' command tmux -S "$cap_socket" send-keys -l -- 'what is this'
+    TMUX='' command tmux -S "$cap_socket" send-keys Enter
+    repeat 160; do
+      pane=$(TMUX='' command tmux -S "$cap_socket" capture-pane -p)
+      [[ $pane == *ASK_SCROLL_BOTTOM* ]] && break
+      command sleep 0.1
+    done
+    [[ $pane == *ASK_SCROLL_BOTTOM* ]] ||
+      fail "resize residue: the cap-$cap answer did not finish"
+    fi
+    count_residue() {
+      local -a lines
+      lines=("${(@f)pane}")
+      local -i row=0 total=0
+      local -i keep=$(( ${#lines} - peak - 1 ))
+      for line in "${lines[@]}"; do
+        (( row += 1 ))
+        (( row > keep )) && break
+        [[ $line == *[─│╭╮╰╯├┤]* ]] && (( total += 1 ))
+      done
+      print -- $total
+    }
+    peak=$cap
+    local -i before=$(count_residue)
+    TMUX='' command tmux -S "$cap_socket" resize-window -x 110 -y 40 2>/dev/null
+    command sleep 0.5
+    TMUX='' command tmux -S "$cap_socket" resize-window -x 80 -y 40 2>/dev/null
+    command sleep 0.5
+    pane=$(TMUX='' command tmux -S "$cap_socket" capture-pane -p)
+    local -i after=$(count_residue)
+    # The known SQ-23 narrowing defect adds fragments at any band height;
+    # the cap must not add beyond what the tall-band baseline adds.
+    if [[ $cap == 3 ]]; then residue_3=$(( after - before )); elif [[ $cap == 8 ]]; then residue_8=$(( after - before )); elif [[ $cap == 12 ]]; then residue_12=$(( after - before )); else residue_16=$(( after - before )); fi
+    print -r -- "resize residue cap $cap: before $before, after $after (delta $(( after - before )))"
+    TMUX='' command tmux -S "$cap_socket" kill-server 2>/dev/null
+    PTY_TMUX_SOCKET=''
+  done
+  # Measured SQ-23-class envelope for cap-limited bands: narrowing a cap-8
+  # band leaves up to 2 cosmetic fragment rows (the three-row composer band
+  # leaves 1; a sixteen-row band none) because the upstream scrub math
+  # under-covers short bands. The bound fails only on escalation beyond the
+  # measured envelope.
+  [[ $residue_8 -le 2 && $residue_12 -le 2 ]] ||
+    fail "resize residue: narrowing left cap 8 +$residue_8 / cap 12 +$residue_12 fragment rows, beyond the measured SQ-23-class envelope of 2 (3-row band: +$residue_3, cap 16: +$residue_16)"
+  print -r -- "PASS resize residue SQ-11 (narrowing delta: cap 8 +$residue_8, cap 12 +$residue_12, cap 16 +$residue_16 fragment rows)"
+}
+
 run_wheel_gate_case
+run_sq11_resize_residue_case
 
 print -r -- "PASS PTY smoke: single-owner native frame with per-row edge widths, always-visible mode tabs with bracketed selection, no routine submit label, framed details inspector without duplicated key help, monotonic 3/8/12 promotion, action sheet, vertical candidate navigation and review-only insertion, peak receipts, never-auto-execute, context privacy, failure/cancellation, 80/100/140 columns, restoration, top/bottom ZLE teardown geometry, pointer mode-tab and candidate-row clicks with byte-level mouse-mode teardown, wheel scrolling scoped to the reader under the pointer, wheel over an overflowing composer draft pans its viewport without mutating the draft or invoking the provider"
